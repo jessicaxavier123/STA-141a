@@ -1,0 +1,566 @@
+---
+title: "Mice, Stimulus, and Brain Reactions"
+date: "17 March, 2025"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r echo=FALSE, eval=TRUE,   message=FALSE}
+
+suppressWarnings(library(tidyverse))
+suppressWarnings(library(knitr))
+suppressWarnings(library(dplyr))
+library(cowplot)
+library(forcats)
+suppressWarnings(library(caret))
+library(lme4)
+suppressWarnings(library(glmnet))
+suppressWarnings(library(MASS))
+suppressWarnings(library(rpart))
+suppressWarnings(library(rpart.plot))
+suppressWarnings(library(e1071))
+suppressWarnings(library(randomForest))
+suppressWarnings(library(xgboost))
+
+```
+
+*You are welcome to adapt the code and ideas from any project consulting sessions without the requirement of acknowledgment*, **as long as you comprehend their underlying principles.** *To be specific, you should be capable of justifying the proposed analysis comprehensively in your report.*
+
+## Abstract
+In a study conducted by Steinmetz et. al in 2019, experiments were held on 10 mice over the course of 39 sessions. Each session was comprised of hundreds of trials in which stimuli was presented to the mice at different contrast levels and their reaction to turning the wheel was recorded. A number of successes and failures were recorded as well as neuron spikes, brain area, feedback type, time, and the contrast right and contrast left stimulus. The dataset that we delve into has 18 sessions with only 4 mice and our aim is to predict the feedback type given to the mice. 
+
+## Introduction
+As there is a lot of information and depth that this experiment goes into, our aim is to make it easier for readers to understand the significance of the experiment through a data analytics approach. To begin with, we represent our information with some simple graphs (EDA) to find any relationships between the variables, to find obscurities within our variables, and determine which ones seems to be too correlated to model feedback type. The next step is picking out the variables that are most significant to predicting the feedback type. The very last but most important step is finding the best model to predict the mice's feedback type. Since this is such an extensive dataset, the goal is to focus on specific variables that believe to contribute the most to the prediction. Step by step, here is the approach I took to modeling the mice's feedback type. 
+
+
+## Objective: Data Integration
+
+
+From the project description, we can see that the ultimate goal of the course project is to predict the outcome (i.e. `feedback_type`) in the test set that contains 100 trials from Session 1 and Session 18. However, as we see from Milestone I, data structure differs across sessions. For instance, Session 1 contains 734 neurons from 8 brain areas, where Session 2 contains 1070 neurons from 5 brain areas. 
+
+
+### Loading the Session Data 
+To start with any any data analytics approach, the first step is always to load the dataset in a way that is understandable and accessible for the data scientist to work through. In this chuck of code, I chose to create a data frame with columns for session ID, trial ID, feedback type, date experimented, contrast left and right and the difference between left and right, success rate, and I also decided to add the average region neuron spikes, total region neuron spikes and the number of regions counted. The toughest part about loading the dataset in was keeping it short. The biggest obstacle was making sure the dataset did not have 4 million values, so that it would not slow down my modeling and EDA. Thus, referencing an old student's work, I decided to create brain regional information to keep the information succinct and easy to work with.  
+
+```{r}
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+}
+get_trial_data <- function(session, trial_id) {
+  spikes <- session$spks[[trial_id]]
+
+  if (any(is.na(spikes))) {
+    message("value missing")  # In case there are any missing values, which there aren't
+  }
+
+  tibble(
+    neuron_spk = rowSums(spikes),
+    brain_area = session$brain_area
+  ) %>%
+    group_by(brain_area) %>%
+    summarize(
+      region_sum_spk = sum(neuron_spk),
+      region_count = n(),
+      region_mean_spk = mean(neuron_spk),
+      .groups = "drop"  # Good practice to drop grouping after summarize
+    ) %>%
+    mutate(
+      trial_id = trial_id,
+      contrast_left = session$contrast_left[trial_id],
+      contrast_right = session$contrast_right[trial_id],
+      feedback_type = session$feedback_type[trial_id]
+    )
+}
+
+# # getting the session data by creating a function that applies session id with the amount of trials in a session
+get_session_data <- function(session, session_id) {
+  n_trials <- length(session$spks)
+
+  # Use map_dfr to iterate and row-bind the information in trials
+  map_dfr(1:n_trials, ~ get_trial_data(session, .x)) %>%
+    mutate(
+      mouse_name = session$mouse_name,
+      date_exp = session$date_exp,
+      session_id = session_id
+    )
+}
+
+# Combine everything together at the end
+
+full_tibble <- map_dfr(1:length(session), function(i) {
+  get_session_data(session[[i]], i)  # Pass session AND session_id
+}) %>%
+  mutate(
+    success = as.numeric(feedback_type == 1),
+    contrast_diff = abs(contrast_left - contrast_right)
+  )
+
+print(full_tibble)
+```
+```{r echo=FALSE, eval=TRUE}
+
+n.session=4
+
+# in library tidyverse
+meta <- tibble(
+  mouse_name = rep('name',n.session),
+  date_exp =rep('dt',n.session),
+  n_brain_area = rep(0,n.session),
+  n_neurons = rep(0,n.session),
+  n_trials = rep(0,n.session),
+  success_rate = rep(0,n.session)
+)
+
+for(i in 1:18){ # ith session 
+  tmp = session[[i]];
+  meta[i,1]=tmp$mouse_name;
+  meta[i,2]=tmp$date_exp;
+  meta[i,3]=length(unique(tmp$brain_area));
+  meta[i,4]=dim(tmp$spks[[1]])[1];
+  meta[i,5]=length(tmp$feedback_type);
+  meta[i,6]=mean(tmp$feedback_type+1)/2;
+}
+kable(meta, format = "html", table.attr = "class='table table-striped'",digits=2) 
+
+
+```
+The variables are as follows: 
+1. Mouse Names: is a categorical variable that has 4 different mice. These different mice can pose variability based on their neural activity and their cognitive abilities and individual differences. 
+
+2. Date Experimented: This shows the rates of each measurement over time to check whether mice improve their performance over time from exposure to the activity. 
+
+3. Number of Brain Areas: The number of distinct brain areas where activity was recorded. A larger number can shed light to a larger perspective of the brain processes that contribute to the decision-making.
+
+4. Number of Neurons: The total number of neurons recorded during a session. A large variation between mice would indicate the variability in the success rate and could signify the need for data integration.
+
+5. Number of Trials: The total number of trials conducted in each session. More trials leads to more reliable estimates made based on the data.
+
+6. Success Rate: The proportion of trials that the mouse made the correct decision. This metric helps understand how well the mouse is applying its knowledge. The variety in the success rate can stem from a wide range of things such as experience, neural activity, and task activity. 
+
+7. Contrast Left and Right: The amount of stimulus in each respective side shown taking the values 0, 0.25, 0.5, 0.75, and 1. 
+
+8. Feedback Type: The response of the mice to the stimulus where 1 indicates success and 0 indicates failure. 
+
+9. Spks: Number of spikes of neurons in the visual cortex with the time interval defined. This represents how well the mice reacts to the stimulus. 
+
+10. Time: The time in seconds that the stimuli is presented to the mice and the mice responds to the stimulus.
+
+
+##EDA 
+Exploratory Data Analysis is one of the key components when it comes to data science. This is where you identify patterns and outliers and enables you to uncover the structure of the data and any hidden insights. The first step of EDA is to always check for missing values.
+```{r}
+missing_values <- colSums(is.na(full_tibble))
+print(missing_values)
+```
+The columns of missing values shows that the data set of the mice has no missing values.
+
+##Visualizations
+###Feedback Type Distribution
+```{r}
+ggplot(full_tibble, aes(x = as.factor(feedback_type), 
+                        fill = as.factor(feedback_type))) +
+  geom_bar() +
+  labs(title = "Feedback Type Distribution", 
+       x = "Feedback Type", 
+       y = "Count",
+       fill = "Feedback Type") +
+  scale_fill_manual(values = c("red", "green"), 
+                    labels = c("Failure", "Success"))
+```
+Analysis: This graph illustrates the number of trials that resulted in success, which is when feedback_type is 1, compared to those that resulted in failure, when feedback_type is -1. Making sure they are balanced is essential for effective modeling because the imbalance may affect the accuracy of future models. This ratio may not hold true for all mice and throughout all trials, so let's explore that more.
+
+###Feedback Type for Each Mouse
+```{r}
+ggplot(full_tibble, aes(x = factor(feedback_type), fill = mouse_name)) +
+  geom_bar(position = "dodge") +  # "dodge" places bars side-by-side
+  facet_wrap(~mouse_name, scales = "free_y") + # Separate panel for each mouse
+  labs(title = "Distribution of Feedback Type per Mouse",
+       x = "Feedback Type",
+       y = "Count",
+       fill = "Mouse Name") +  # Add legend title
+  theme_bw() +
+  scale_x_discrete(labels = c("-1" = "Failure", "1" = "Success")) + # Clear labels
+  theme(legend.position = "top")
+```
+Analysis: Now, we can see that for the each mice the ratio from failure to success is same as the overall distribution. The amount of success and failures varies among mice with Lederberg having the highest success rate and lowest failure rate and Cori have the lowest success rate and the highest failure rate. 
+
+###Total Spikes per Mouse
+```{r}
+mouse_names <- unique(full_tibble$mouse_name)
+plot_list <- list()
+for (mouse in mouse_names) {
+  # Subset the data for the current mouse
+  mouse_data <- full_tibble %>% filter(mouse_name == mouse)
+
+  # Create the boxplot
+  p <- ggplot(mouse_data, aes(x = brain_area, y = region_mean_spk, fill = brain_area)) +
+    geom_boxplot() +
+    labs(title = paste("Region Mean Spikes by Brain Area -", mouse), # Add mouse name to title
+         x = "Brain Area",
+         y = "Region Mean Spikes",
+         fill = "Brain Area") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+          legend.position = "none")  # Remove legend to save space
+
+  # Add the plot to the list
+  plot_list[[mouse]] <- p
+}
+
+# Print the plots (you can choose one of the following options)
+
+# Option 1: Print each plot individually (in the console)
+print(plot_list)
+
+
+
+```
+Analysis: Here we have plotted each region average neuron spike for each mouse. For Cori, the highest average we can see is for MRN and there are not many outliers in terms of brain area neural spikes. Forssmann has many more brain areas used and the highest being LD. Compared to Cori, Forssmann has a lot more outliers in terms of neural spikes within each brain area. Hench also has a lot more brain areas, the highest average being VPL, but Hench has numerous outliers especially in LSr. Lederberg's highest average is RN and also has a wide variety of brain areas. This is a great representation of what mice is involving which parts of their brain.
+
+###Contrast Left per Mouse
+```{r}
+ggplot(full_tibble, aes(x = contrast_left, fill = mouse_name)) +
+  geom_histogram(position = "dodge", binwidth = 0.1) +  # Adjust binwidth as needed
+  facet_wrap(~mouse_name, scales = "free_y") +
+  labs(title = "Distribution of Contrast Left per Mouse",
+       x = "Contrast Left",
+       y = "Count",
+       fill = "Mouse Name") 
+```
+Analysis: All of the mice had a lot of exposure to contrast left when it is at 0. This might be due to the fact that the mice were being trained on their stimuli. Another important note to make is that none of the mice had exposure to 0.75 constrast because it was not part of the experimental exposure level. Hench had more of a distributed exposure to the contrast comparatively and Cori had the least amount of exposure to the other contrasts.
+
+###Contrast Right per Mouse
+```{r}
+ggplot(full_tibble, aes(x = contrast_right, fill = mouse_name)) +
+  geom_histogram(position = "dodge", binwidth = 0.1) +  # Adjust binwidth as needed
+  facet_wrap(~mouse_name, scales = "free_y") +
+  labs(title = "Distribution of Contrast Right per Mouse",
+       x = "Contrast Left",
+       y = "Count",
+       fill = "Mouse Name") 
+```
+Analysis: These are the same graphs as before but just with contrast right. Again, all mice had the most exposure to a contrast level of 0. Cori had the least exposure counts to the other mice. Lederberg had the most which could signify the difference in brain areas used between Lederberg and Cori. Hench had more exposure than Forssmann, but Forssmann was the most evenly distributed in terms of contrast levels exposed to. 
+
+###Brain Area vs Feedback Type
+```{r}
+brain_area_feedback <- full_tibble %>%
+  group_by(brain_area, feedback_type) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(brain_area) %>%
+  mutate(proportion = count / sum(count))
+
+ggplot(brain_area_feedback, aes(x = brain_area, y = proportion, fill = factor(feedback_type))) +
+  geom_col() +  # Using geom_col for proportions
+  labs(title = "Proportion of Feedback Types by Brain Area",
+       x = "Brain Area",
+       y = "Proportion",
+       fill = "Feedback Type") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 5)) +
+  scale_fill_discrete(labels = c("-1" = "Failure", "1" = "Success"))
+```
+Analysis: This is an interesting way of seeing which brain areas work better than others. As the graph shows there is a pretty even distribution to the success rate of each brain area. On that note, MEA and RT had the largest success rate but it was not by much. This shows that the brain area used did not heavily impact the way the feedback type was given. 
+
+###Brain Area vs Contrast Type
+```{r}
+contrast_left_data <- full_tibble %>%
+  dplyr::select(brain_area, contrast_left) %>% # tells R to use the dplyr package instead of any other package
+  rename(Contrast_Value = contrast_left) %>%
+  mutate(Contrast_Side = "contrast_left")
+
+contrast_right_data <- full_tibble %>%
+  dplyr::select(brain_area, contrast_right) %>%
+  rename(Contrast_Value = contrast_right) %>%
+  mutate(Contrast_Side = "contrast_right")
+
+contrast_data <- bind_rows(contrast_left_data, contrast_right_data)
+
+plot_list <- list()
+for (side in unique(contrast_data$Contrast_Side)) {
+  # 3. Filter data and calculate the mean
+  side_data <- contrast_data %>%
+        filter(Contrast_Side == side) %>%
+        group_by(brain_area) %>%
+        summarize(mean_contrast = mean(Contrast_Value, na.rm=TRUE), .groups = "drop")
+
+  # 4. Create the plot
+  p <- ggplot(side_data, aes(x = brain_area, y = mean_contrast)) +
+    geom_bar(stat = "identity", fill = ifelse(side == "contrast_left", "skyblue", "coral")) + #conditional fill
+    labs(x = "Brain Area",
+         y = "Mean Contrast Value",
+         title = paste("Mean Contrast Value by Brain Area -", side)) +
+    theme_bw() +
+    theme(axis.text.y = element_text(hjust = 1, size = 5)) +
+    coord_flip()
+
+  # 5. Store the plot
+  plot_list[[side]] <- p
+}
+
+# Print individual plots
+print(plot_list)
+```
+Analysis: Between contrast right and contrast left, the distribution is ver alike and the almost all the same brain areas are activated in each contrast. If one contrast is higher than the other for a brain area, this shows the contrast that has a higher distribution was shown more or was used more by that brain area. 
+
+###Feedback Type vs Region Total Spikes
+```{r}
+ggplot(full_tibble, aes(x = as.factor(feedback_type), y = region_sum_spk, fill = as.factor(feedback_type))) +
+  geom_boxplot() +
+  labs(title = "Feedback Type vs. Regional Total Spikes", x = "Feedback Type", y = "Region Total Spikes", fill = "Feedback Type") +
+  scale_fill_manual(values = c("red", "green"))
+```
+Analysis: This graph compares the average number of spikes from each brain area that was successful and which ones failed. The median between the success and failure feedback types is pretty similar, but there is a lot of outliers and this can disregarded when predicting the feedback type.
+
+###Feedback Type vs Success Rate per Session
+```{r}
+full_tibble %>%
+  group_by(session_id) %>%
+  summarize(success_rate = mean(feedback_type == 1)) %>%
+  ggplot(aes(x = session_id, y = success_rate)) +
+  geom_bar(stat = "identity", fill = "purple") +
+  labs(title = "Feedback Success Rate per Session", x = "Session ID", y = "Success Rate") +
+  theme_minimal()
+```
+Analysis: This plots the success rate as in the correct interpretation of the stimulus. Since there is not large variability across the sessions, session ID might not influence feedbacl type, but there seems to be a overall increase in successs rate as session ID which may or may not be correlated.  
+
+### Brain Region Average Spikes for Each Mouse
+```{r}
+ggplot(full_tibble, aes(x = mouse_name, y = region_mean_spk, fill = mouse_name)) +
+  geom_boxplot() +
+  labs(title = "Distribution of Region Mean Spikes per Mouse",
+       x = "Mouse Name", 
+       y = "Region Mean Spikes",
+       fill = "Mouse Name")
+
+```
+Analysis: This graph shows the variance in average spike counts for each brain area. Lederberg and Hench have high variability which may indicate different neural response patterns. Based on our other graphs, we know that Lederberg and Hench engage in more brain areas than the other two mice which may explain the extensive outliers. 
+
+## Data Integration
+The next important step is data integration where we combine data so that we have more important, simple data to work with when modeling. Since we have done so in the beginning, the next move is to finding out which variables are the most significant in variance and we do this by using PCA. PCA, which means principal component analysis, is a method that simplifies complex data by informing which features are the most important features. This makes modeling much easier to work with and we do not have to work with any collinear variables. 
+
+###PCA
+```{r}
+pca_data <- full_tibble %>%
+  dplyr::select(where(is.numeric), -trial_id, -session_id)
+
+pca_data_scaled <- scale(pca_data)
+pca_result <- prcomp(pca_data_scaled, scale. = FALSE)
+
+summary(pca_result)
+
+plot(pca_result, type = "l")
+```
+Analysis: The most significant PC is the first and second one which alone explains 48% of the variation in data because they are pretty evenly distriuted. Adding PC3 would explain 68% of the variation in the data and adding the 4th, 5th, 6th PC would explain 100% of the data. The 8th PC does not contribute to the explained variance so it can be dropped as a feature (contrast_diff is heavily correlated with contrast_left and contrast_right).
+
+
+###Feature Selection
+This is where we choose the specific variables that we determined were the most significant to modeling and making sure everything is scaled so there is no skew when modeling.
+```{r}
+predictive_feature <- c("region_sum_spk", "region_count", "region_mean_spk", "contrast_diff", "feedback_type", "brain_area", "mouse_name")
+predictive_data <- full_tibble[predictive_feature]
+
+
+predictive_data$region_sum_spk <- scale(predictive_data$region_sum_spk)
+predictive_data$region_count <- scale(predictive_data$region_count)
+predictive_data$region_mean_spk <- scale(predictive_data$region_mean_spk)
+predictive_data$contrast_diff <- scale(predictive_data$contrast_diff)
+
+#Convert 'feedback_type' to a factor because LDA requires the outcome to be a factor
+predictive_data$feedback_type <- as.factor(predictive_data$feedback_type)
+
+```
+
+
+###Train-Test Split
+Train-Test Split is an important step before modeling. There are many ways to do it, but the way I chose to do it was to split the data (with the feature selection) into 80% of training data so that the model has expansive data to train on and hide the other 20% to test after the model has been trained on. The y-variable that we are trying to predict is the feedback type and the rest of the variables are our x-variables.
+
+```{r}
+set.seed(42)  # For reproducibility
+train_size <- floor(0.8 * nrow(predictive_data))  # 80% for training
+train_index <- sample(seq_len(nrow(predictive_data)), size = train_size)
+label <- full_tibble$feedback_type
+label <- ifelse(label == -1, 0, label)
+
+X_train <- predictive_data[train_index, !names(predictive_data) %in% "feedback_type"]
+X_test <- predictive_data[-train_index, !names(predictive_data) %in% "feedback_type"]
+y_train <- label[train_index]
+y_test <- label[-train_index]
+
+```
+
+
+### LDA Modeling
+The first model I chose to do was LDA. LDA or linear discriminant analysis is a supervised machine learning method that is used for classification and reduction by finding a linear combination of features that best separates multiple groups. LDA works well when the data is roughly normally distributed.
+```{r}
+lda_model <- lda(y_train ~ ., data = X_train)
+
+# Examine the Output
+predictions <- predict(lda_model, newdata = X_test)
+
+confusion_matrix <- table(y_test, predictions$class)
+print(confusion_matrix)
+
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+print(paste("Training Accuracy:", accuracy))
+```
+Analysis: Based on the confusion matrix printed, we can see that there is a high false positive which may be due to the fact there are collinear variables. On the other hand, there is not a high number of false negatives. This model can definitely be improved from an accuracy rate of 0.7024. From our output, we can see that there are variables within our predictive data frame that is collinear. This model is really good at predicting when the feedback type is 1 and not when it is 0. This may be because there was more 1's than 0's in our training data. Let's see if we can find a better model.
+
+### Decision Tree Classifier
+Decision Tree Classifier is another supervised machine learning method that uses a tree structure to classify data and the final leaf nodes represent the final classification outcome. 
+```{r}
+tree_model <- rpart(y_train ~ ., data = X_train, method = "class")
+print(tree_model)
+
+# Predictions (using test data)
+predictions <- predict(tree_model, newdata = X_test, type = "class")
+
+# Confusion Matrix (Training Data)
+confusion_matrix <- table(y_test, predictions)
+print(confusion_matrix)
+
+# Accuracy (Training Data)
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+print(paste("Training Accuracy:", accuracy))
+```
+Analysis: It seems that the accuracy has not improved much from the LDA modeling. This time there is no false negatives, but there seems to be a large number of false positives which may be due to a class imbalance. There is also no true negatives which gives a skewed distribution. Comparatively to LDA, the model has improved slightly. 
+
+###Random Forest
+```{r}
+tune_grid <- expand.grid(mtry = c(2, 4, 6, 8))
+rf_model <- randomForest(x = X_train, y = y_train,, method = "rf", # y = y_train (a factor)
+                        trControl = train_control, tuneGrid = tune_grid,
+                        ntree = 500, importance = TRUE)  # ntree = number of trees
+
+
+
+# --- Predictions (using randomForest package) ---
+predictions <- predict(rf_model, newdata = X_test)
+
+# --- Evaluation (using randomForest package) ---
+confusion_matrix <- table(y_test, predictions)
+print(confusion_matrix)
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+print(paste("Test Accuracy:", accuracy))
+```
+
+
+###Naive Bayes
+Naive Bayes is a probabilistic machine learning model that is based on Bayes' Theorem that assumes the features are independent of each other.
+```{r}
+nb_model <- naiveBayes(y_train~ ., data = X_train)
+
+#   - Predictions on the test set:
+predictions <- predict(nb_model, newdata = X_test)
+
+# 5. Model Evaluation
+
+#   - Confusion Matrix:
+confusion_matrix <- table(y_test, predictions)
+print(confusion_matrix)
+
+
+#   - Accuracy:
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+print(paste("Test Accuracy:", accuracy))
+```
+Analysis: According to the confusion matrix there is more true negatives than the Decision Tree Classifier, but there is also a large number of false positives and false negatives. The accuracy score of this model has decreased compared to the other two models which shows that this model can be improved more. 
+
+##Test Data Given
+```{r}
+test_given=list()
+for(i in 1:2){
+  test_given[[i]]=readRDS(paste('./TestData/test',i,'.rds',sep=''))
+}
+test_tibble <- map_dfr(1:length(test_given), function(i) {
+  get_session_data(session[[i]], i)  # Pass session AND session_id
+}) %>%
+  mutate(
+    success = as.numeric(feedback_type == 1),
+    contrast_diff = abs(contrast_left - contrast_right)
+  )
+head(test_tibble)
+```
+###Train-Test Split on X-Test Given
+```{r}
+set.seed(42)  # For reproducibility
+predictive_feature <- c("region_sum_spk", "region_count", "region_mean_spk", "contrast_diff", "feedback_type", "brain_area", "mouse_name")
+pred_data <- test_tibble[predictive_feature]
+
+pred_data$region_sum_spk <- scale(pred_data$region_sum_spk)
+pred_data$region_count <- scale(pred_data$region_count)
+pred_data$region_mean_spk <- scale(pred_data$region_mean_spk)
+pred_data$contrast_diff <- scale(pred_data$contrast_diff)
+
+#Convert 'feedback_type' to a factor because LDA requires the outcome to be a factor
+pred_data$feedback_type <- as.factor(pred_data$feedback_type)
+#head(pred_data_2)
+X_train_g <- predictive_data %>%
+  dplyr::select(-feedback_type)
+X_test_g <- pred_data %>%
+  dplyr::select(-feedback_type)
+y_train_g <- label
+y_test_g <- pred_data$feedback_type
+head(X_train_g)
+head(X_test_g)
+```
+
+##LDA Model with Test Data Given
+```{r}
+lda_model <- lda(y_train ~ ., data = X_train)
+
+# Examine the Output
+predictions <- predict(lda_model, newdata = X_test_g)
+
+confusion_matrix <- table(y_test_g, predictions$class)
+print(confusion_matrix)
+
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+print(paste("Training Accuracy:", accuracy))
+```
+Analysis: There seems to be significantly more true positives than true negatives, but there also seems to be a large number of false positives and false negatives which was  a problem when first training the data. Overall, our accuracy for our training model has decreased when tested on the given data and this may be due to a number of factor such as unbalanced classes, collinear variables, or not a representative training data set. These are issues that can contribute to the low accuracy score. 
+
+###Decision Tree Classsifier with X-Test Given
+```{r}
+tree_model <- rpart(y_train ~ ., data = X_train, method = "class")
+print(tree_model)
+
+# Predictions (using test data)
+predictions <- predict(tree_model, newdata = X_test_g, type = "class")
+
+# Confusion Matrix (Training Data)
+confusion_matrix <- table(y_test_g, predictions)
+print(confusion_matrix)
+
+# Accuracy (Training Data)
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+print(paste("Training Accuracy:", accuracy))
+```
+Analysis: The accuracy score for the decision tree classifier also decreased. There seems to be less false positives this time but it is particularly high. Again, the issues said before can account for this unusually high false positives. This is a decent accuracy score, but there is room for improvement
+
+###Naive Bayes with X-Test Given
+```{r}
+nb_model <- naiveBayes(y_train~ ., data = X_train)
+
+#   - Predictions on the test set:
+predictions <- predict(nb_model, newdata = X_test_g)
+
+# 5. Model Evaluation
+
+#   - Confusion Matrix:
+confusion_matrix <- table(y_test_g, predictions)
+print(confusion_matrix)
+
+
+#   - Accuracy:
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+print(paste("Test Accuracy:", accuracy))
+```
+Analysis: The accuracy score for this also fell about 10%. The confusion matrix shows a lot more false positives than predicting it on the previous test data. This could mean a number of things and seems like there are better models out there that can better represent the data. 
+
+##Discussion 
+It seems as though the models that we have produced have outputted some decent accuracy scores, with lots of room for improvement. There were many factors that contributed to the decrease in accuracy score from some (maybe) collinear variables, or the class of 0 and 1's in feedback type were unbalanced or the variables were not scaled properly. There is so much tuning that we could do with these models, but I think there are also models that can work better like XGBoost or Neural Networks. I did not have the time to research and implement these models in time for the deadline, but they are definitely very powerful modeling techniques used to model data well. As well as finding more models, I think with time, I would be able to play around with ways I could input values for training and test data. A majority of the false positives and negatives might have been due to the class imbalances of 0's and 1's in the feedback_type variable and can lead to bias in the models. These are definitely next steps to take for the future. These mice and their stimulus reactions are just the beginning of what data science can do to represent data and bring light to many new fields and build a futuristic modeling world. This is a great beginning to what data science has in store for us.
+
+** I did use LLMs to help me code this project, but I was not logged into the LLM so none of the chats saved (I hope this is okay).
+ 
